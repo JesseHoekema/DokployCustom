@@ -1,5 +1,5 @@
 #!/bin/bash
-
+ 
 # Function to detect if running in Proxmox LXC container
 is_proxmox_lxc() {
     # Check for LXC in environment
