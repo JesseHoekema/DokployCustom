@@ -45,6 +45,12 @@ install_dokploy() {
         exit 1
     fi
 
+    # check if something is running on port 3000
+    if ss -tulnp | grep ':3000 ' >/dev/null; then
+        echo "Error: something is already running on port 3000" >&2
+        exit 1
+    fi
+
     command_exists() {
       command -v "$@" > /dev/null 2>&1
     }
@@ -55,20 +61,14 @@ install_dokploy() {
       curl -sSL https://get.docker.com | sh
     fi
 
-    # Check if running in Proxmox LXC container and set endpoint mode
-    endpoint_mode=""
-    if is_proxmox_lxc; then
-        echo "⚠️ WARNING: Detected Proxmox LXC container environment!"
-        echo "Adding --endpoint-mode dnsrr to Docker service for LXC compatibility."
-        echo "This may affect service discovery but is required for LXC containers."
-        echo ""
-        endpoint_mode="--endpoint-mode dnsrr"
-        echo "Waiting for 5 seconds before continuing..."
-        sleep 5
-    fi
+    # Create Docker network
+    docker network rm -f dokploy-network 2>/dev/null
+    docker network create dokploy-network
 
+    echo "Network created"
 
-    docker swarm leave --force 2>/dev/null
+    mkdir -p /etc/dokploy
+    chmod 777 /etc/dokploy
 
     get_ip() {
         local ip=""
@@ -127,85 +127,61 @@ install_dokploy() {
     fi
     echo "Using advertise address: $advertise_addr"
 
-    docker swarm init --advertise-addr $advertise_addr
-    
-     if [ $? -ne 0 ]; then
-        echo "Error: Failed to initialize Docker Swarm" >&2
-        exit 1
-    fi
+    # Stop and remove existing containers
+    docker stop dokploy-postgres dokploy-redis dokploy dokploy-traefik 2>/dev/null
+    docker rm dokploy-postgres dokploy-redis dokploy dokploy-traefik 2>/dev/null
 
-    echo "Swarm initialized"
+    # Start PostgreSQL container
+    docker run -d \
+        --name dokploy-postgres \
+        --network dokploy-network \
+        --restart unless-stopped \
+        -e POSTGRES_USER=dokploy \
+        -e POSTGRES_DB=dokploy \
+        -e POSTGRES_PASSWORD=amukds4wi9001583845717ad2 \
+        -v dokploy-postgres-database:/var/lib/postgresql/data \
+        postgres:16
 
-    docker network rm -f dokploy-network 2>/dev/null
-    docker network create --driver overlay --attachable dokploy-network
+    # Start Redis container
+    docker run -d \
+        --name dokploy-redis \
+        --network dokploy-network \
+        --restart unless-stopped \
+        -v redis-data-volume:/data \
+        redis:7
 
-    echo "Network created"
+    # Wait for databases to be ready
+    echo "Waiting for databases to start..."
+    sleep 10
 
-    mkdir -p /etc/dokploy
+    # Start Dokploy container with proper port mapping
+    docker run -d \
+        --name dokploy \
+        --network dokploy-network \
+        --restart unless-stopped \
+        -p 3000:3000 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /etc/dokploy:/etc/dokploy \
+        -v dokploy-docker-config:/root/.docker \
+        -e ADVERTISE_ADDR=$advertise_addr \
+        dokploy/dokploy:latest
 
-    chmod 777 /etc/dokploy
+    # Wait for Dokploy to start
+    echo "Waiting for Dokploy to start..."
+    sleep 10
 
-    docker service create \
-    --name dokploy-postgres \
-    --constraint 'node.role==manager' \
-    --network dokploy-network \
-    --env POSTGRES_USER=dokploy \
-    --env POSTGRES_DB=dokploy \
-    --env POSTGRES_PASSWORD=amukds4wi9001583845717ad2 \
-    --mount type=volume,source=dokploy-postgres-database,target=/var/lib/postgresql/data \
-    postgres:16
-
-    docker service create \
-    --name dokploy-redis \
-    --constraint 'node.role==manager' \
-    --network dokploy-network \
-    --mount type=volume,source=redis-data-volume,target=/data \
-    redis:7
-
-    # Installation
-    docker service create \
-      --name dokploy \
-      --replicas 1 \
-      --network dokploy-network \
-      --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
-      --mount type=bind,source=/etc/dokploy,target=/etc/dokploy \
-      --mount type=volume,source=dokploy-docker-config,target=/root/.docker \
-      --publish published=3000,target=3000,mode=host \
-      --update-parallelism 1 \
-      --update-order stop-first \
-      --constraint 'node.role == manager' \
-      $endpoint_mode \
-      -e ADVERTISE_ADDR=$advertise_addr \
-      dokploy/dokploy:latest
-
-    sleep 4
-
+    # Start Traefik container with proper port mapping
     docker run -d \
         --name dokploy-traefik \
-        --restart always \
+        --network dokploy-network \
+        --restart unless-stopped \
+        -p 80:80 \
+        -p 443:443 \
+        -p 443:443/udp \
         -v /etc/dokploy/traefik/traefik.yml:/etc/traefik/traefik.yml \
         -v /etc/dokploy/traefik/dynamic:/etc/dokploy/traefik/dynamic \
         -v /var/run/docker.sock:/var/run/docker.sock \
-        -p 80:80/tcp \
-        -p 443:443/tcp \
-        -p 443:443/udp \
         traefik:v3.5.0
-    
-    docker network connect dokploy-network dokploy-traefik
-
-
-    # Optional: Use docker service create instead of docker run
-    #   docker service create \
-    #     --name dokploy-traefik \
-    #     --constraint 'node.role==manager' \
-    #     --network dokploy-network \
-    #     --mount type=bind,source=/etc/dokploy/traefik/traefik.yml,target=/etc/traefik/traefik.yml \
-    #     --mount type=bind,source=/etc/dokploy/traefik/dynamic,target=/etc/dokploy/traefik/dynamic \
-    #     --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
-    #     --publish mode=host,published=443,target=443 \
-    #     --publish mode=host,published=80,target=80 \
-    #     --publish mode=host,published=443,target=443,protocol=udp \
-    #     traefik:v3.5.0
 
     GREEN="\033[0;32m"
     YELLOW="\033[1;33m"
@@ -229,6 +205,10 @@ install_dokploy() {
     printf "${GREEN}Congratulations, Dokploy is installed!${NC}\n"
     printf "${BLUE}Wait 15 seconds for the server to start${NC}\n"
     printf "${YELLOW}Please go to http://${formatted_addr}:3000${NC}\n\n"
+    
+    # Show container status
+    echo "Container status:"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=dokploy"
 }
 
 update_dokploy() {
@@ -237,8 +217,28 @@ update_dokploy() {
     # Pull the latest image
     docker pull dokploy/dokploy:latest
 
-    # Update the service
-    docker service update --image dokploy/dokploy:latest dokploy
+    # Stop and remove the old container
+    docker stop dokploy
+    docker rm dokploy
+
+    # Get the advertise address
+    get_private_ip() {
+        ip addr show | grep -E "inet (192\.168\.|10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.)" | head -n1 | awk '{print $2}' | cut -d/ -f1
+    }
+    
+    advertise_addr="${ADVERTISE_ADDR:-$(get_private_ip)}"
+
+    # Start the new container
+    docker run -d \
+        --name dokploy \
+        --network dokploy-network \
+        --restart unless-stopped \
+        -p 3000:3000 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /etc/dokploy:/etc/dokploy \
+        -v dokploy-docker-config:/root/.docker \
+        -e ADVERTISE_ADDR=$advertise_addr \
+        dokploy/dokploy:latest
 
     echo "Dokploy has been updated to the latest version."
 }
